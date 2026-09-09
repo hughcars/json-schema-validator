@@ -141,7 +141,8 @@ typedef std::function<void(const std::string & /*contentEncoding*/, const std::s
 // including the schema keyword value when available, belongs in details.
 struct validation_error {
 	json::json_pointer instance_location;
-	json instance;
+	// Non-owning; copy the instance when retaining error data beyond the callback.
+	const json &instance;
 	std::string message;
 	std::string keyword;
 	json details;

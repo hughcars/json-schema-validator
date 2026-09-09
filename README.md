@@ -256,8 +256,10 @@ int main()
 
 New `error_handler` implementations receive a `validation_error` containing the instance
 location, instance value, human-readable message, failed JSON Schema `keyword`, and an
-extensible `details` object. When available, the schema keyword value is stored in
-`details["value"]`; other keyword-specific information can be added alongside it.
+extensible `details` object. The instance is a non-owning reference to the value being
+validated; handlers which retain error data beyond the callback must copy it. When available,
+the schema keyword value is stored in `details["value"]`; other keyword-specific information
+can be added alongside it.
 
 Handlers which override the previous three-argument callback remain source-compatible. The
 structured callback forwards to that overload by default; new handlers should override the

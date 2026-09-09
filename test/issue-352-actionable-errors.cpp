@@ -25,15 +25,23 @@ using nlohmann::json_schema::validation_error;
 namespace
 {
 
+struct recorded_validation_error {
+	json::json_pointer instance_location;
+	json instance;
+	std::string message;
+	std::string keyword;
+	json details;
+};
+
 class collecting_error_handler : public error_handler
 {
 	void error(const validation_error &error) override
 	{
-		errors.push_back(error);
+		errors.push_back({error.instance_location, error.instance, error.message, error.keyword, error.details});
 	}
 
 public:
-	std::vector<validation_error> errors;
+	std::vector<recorded_validation_error> errors;
 };
 
 class incomplete_error_handler : public error_handler
