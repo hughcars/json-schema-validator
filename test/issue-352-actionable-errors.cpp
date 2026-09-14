@@ -3,6 +3,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 static int error_count;
@@ -35,9 +36,9 @@ struct recorded_validation_error {
 
 class collecting_error_handler : public error_handler
 {
-	void error(const validation_error &error) override
+	void error(const validation_error &error, const json &instance) override
 	{
-		errors.push_back({error.instance_location, error.instance, error.message, error.keyword, error.details});
+		errors.push_back({error.instance_location, instance, error.message, error.keyword, error.details});
 	}
 
 public:
@@ -675,6 +676,15 @@ void test_combination_default_values()
 	EXPECT_EQ(patch, json::array());
 }
 
+void test_validation_error_is_a_value_type()
+{
+	static_assert(std::is_default_constructible<validation_error>::value, "validation_error must be default-constructible");
+	static_assert(std::is_copy_assignable<validation_error>::value, "validation_error must be copy-assignable");
+	std::vector<validation_error> errors(2);
+	errors.erase(errors.begin());
+	EXPECT_EQ(errors.size(), 1);
+}
+
 void test_non_keyword_error_details()
 {
 	collecting_error_handler errors;
@@ -772,6 +782,7 @@ int main()
 	test_reentrant_validation_inside_probe();
 	test_probe_state_after_unwinding_and_reentrant_handler();
 	test_combination_default_values();
+	test_validation_error_is_a_value_type();
 	test_non_keyword_error_details();
 	test_basic_error_handler();
 	test_incomplete_error_handler();

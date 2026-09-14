@@ -226,11 +226,11 @@ int main()
     /* json-parse the people - with custom error handler */
     class custom_error_handler : public nlohmann::json_schema::basic_error_handler
     {
-        void error(const nlohmann::json_schema::validation_error &error) override
+        void error(const nlohmann::json_schema::validation_error &error, const json &instance) override
         {
-            nlohmann::json_schema::basic_error_handler::error(error);
+            nlohmann::json_schema::basic_error_handler::error(error, instance);
             std::cerr << "ERROR: '" << error.instance_location << "' - '"
-                      << error.instance << "': " << error.message << "\n";
+                      << instance << "': " << error.message << "\n";
         }
     };
 
@@ -255,11 +255,12 @@ int main()
 ## Validation errors
 
 New `error_handler` implementations receive a `validation_error` containing the instance
-location, instance value, human-readable message, failed JSON Schema `keyword`, and an
-extensible `details` object. The instance is a non-owning reference to the value being
-validated; handlers which retain error data beyond the callback must copy it. When available,
-the schema keyword value is stored in `details["value"]`; other keyword-specific information
-can be added alongside it.
+location, human-readable message, failed JSON Schema `keyword`, and an extensible `details`
+object, together with a reference to the instance value which failed. `validation_error` is a
+plain value type and may be copied and stored freely; the instance reference is valid for the
+duration of the callback, as it always has been, so handlers which retain it must copy it. When
+available, the schema keyword value is stored in `details["value"]`; other keyword-specific
+information can be added alongside it.
 
 Handlers which override the previous three-argument callback remain source-compatible. The
 structured callback forwards to that overload by default; new handlers should override the
@@ -296,14 +297,18 @@ location with a direct message.
 ```C++
 class collecting_handler : public nlohmann::json_schema::error_handler
 {
-    void error(const nlohmann::json_schema::validation_error &error) override
+    void error(const nlohmann::json_schema::validation_error &error, const json &instance) override
     {
-        std::cerr << "ERROR: '" << error.instance_location << "' - '"
-                  << error.instance << "': " << error.message << "\n";
+        errors.push_back(error); // value type: safe to keep
+        failing_instances.push_back(instance); // reference: copy if it is needed later
 
         if (error.keyword == "enum")
             std::cerr << "Allowed values: " << error.details.at("value") << "\n";
     }
+
+public:
+    std::vector<nlohmann::json_schema::validation_error> errors;
+    std::vector<json> failing_instances;
 };
 ```
 

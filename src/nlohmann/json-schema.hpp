@@ -136,13 +136,16 @@ typedef std::function<void(const json_uri & /*id*/, json & /*value*/)> schema_lo
 typedef std::function<void(const std::string & /*format*/, const std::string & /*value*/)> format_checker;
 typedef std::function<void(const std::string & /*contentEncoding*/, const std::string & /*contentMediaType*/, const json & /*instance*/)> content_checker;
 
-// Machine-readable details for a validation failure. The keyword is empty when the validator
-// does not provide schema-keyword details for that failure. Keyword-specific information,
-// including the schema keyword value when available, belongs in details.
+// Machine-readable description of a validation failure. This is a plain value type: it owns
+// everything it contains and may be copied and stored freely. The instance which
+// failed is passed to error_handler::error separately, by reference, exactly as in the original
+// callback; it is valid for the duration of that call only.
+//
+// The keyword is empty when the validator does not provide schema-keyword details for that
+// failure. Keyword-specific information, including the schema keyword value when available,
+// belongs in details.
 struct validation_error {
 	json::json_pointer instance_location;
-	// Non-owning; copy the instance when retaining error data beyond the callback.
-	const json &instance;
 	std::string message;
 	std::string keyword;
 	json details;
@@ -156,9 +159,9 @@ public:
 
 	// New handlers should override this structured callback. By default it forwards to
 	// the original callback below so existing handlers remain source-compatible.
-	virtual void error(const validation_error &error)
+	virtual void error(const validation_error &error, const json &instance)
 	{
-		this->error(error.instance_location, error.instance, error.message);
+		this->error(error.instance_location, instance, error.message);
 	}
 
 	virtual void error(const json::json_pointer & /*ptr*/,
@@ -174,9 +177,9 @@ class JSON_SCHEMA_VALIDATOR_API basic_error_handler : public error_handler
 	bool error_{false};
 
 public:
-	void error(const validation_error &error) override
+	void error(const validation_error &error, const json &instance) override
 	{
-		error_handler::error(error);
+		error_handler::error(error, instance);
 	}
 
 	void error(const json::json_pointer & /*ptr*/,
