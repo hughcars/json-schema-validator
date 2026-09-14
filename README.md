@@ -277,6 +277,7 @@ The details object uses the following common members:
 | Member                                   | Meaning                                                        |
 | ---------------------------------------- | -------------------------------------------------------------- |
 | `value`                                  | Parsed value of the failed schema keyword, when retained       |
+|                                          | (not repeated for `required` / `dependencies` list entries)    |
 | `actual_type`                            | JSON type of the instance for a `type` failure                 |
 | `missing_property`                       | Required property which is absent                              |
 | `property`                               | Property associated with an object constraint                  |

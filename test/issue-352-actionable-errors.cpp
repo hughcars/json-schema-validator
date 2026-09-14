@@ -175,8 +175,8 @@ void test_object_keyword_details()
 {
 	expect_single_error({{"type", "object"}, {"minProperties", 2}}, {{"a", 1}}, "minProperties", {{"value", 2}});
 	expect_single_error({{"type", "object"}, {"maxProperties", 1}}, {{"a", 1}, {"b", 2}}, "maxProperties", {{"value", 1}});
-	expect_single_error({{"type", "object"}, {"required", {"a", "b"}}}, {{"a", 1}}, "required", {{"value", {"a", "b"}}, {"missing_property", "b"}});
-	expect_single_error({{"type", "object"}, {"dependencies", {{"credit_card", {"billing_address"}}}}}, {{"credit_card", 1}}, "dependencies", {{"value", {"billing_address"}}, {"property", "credit_card"}, {"missing_property", "billing_address"}});
+	expect_single_error({{"type", "object"}, {"required", {"a", "b"}}}, {{"a", 1}}, "required", {{"missing_property", "b"}});
+	expect_single_error({{"type", "object"}, {"dependencies", {{"credit_card", {"billing_address"}}}}}, {{"credit_card", 1}}, "dependencies", {{"property", "credit_card"}, {"missing_property", "billing_address"}});
 	expect_single_error({{"type", "object"}, {"additionalProperties", false}}, {{"extra", 1}}, "additionalProperties", {{"value", false}}, "unexpected additional property 'extra'");
 	expect_single_error({{"type", "object"}, {"additionalProperties", {{"type", "object"}, {"additionalProperties", false}}}}, {{"outer", {{"inner", 1}}}}, "additionalProperties", {{"value", false}}, "unexpected additional property 'inner'");
 	expect_single_error({{"type", "object"}, {"propertyNames", false}}, {{"bad", 1}}, "propertyNames", {{"property", "bad"}, {"value", false}}, "invalid property name 'bad'");

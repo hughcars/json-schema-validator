@@ -376,9 +376,9 @@ namespace
 
 // Speculative evaluation ("probing") asks a subschema only whether it validates: not/if/contains,
 // and the branches of allOf/anyOf/oneOf. While a probe is running nothing rendered for an error
-// can reach a user handler, so combinators skip their diagnostics phase. The probe state is a
-// thread-local depth so that it is seen through any forwarding handler in between and needs no
-// RTTI.
+// can reach a user handler, so combinators skip their diagnostics phase and error sites skip
+// copying schema data into details. The probe state is a thread-local depth so that it is seen
+// through any forwarding handler in between and needs no RTTI.
 class probe_error_handler : public error_handler
 {
 	bool failed_{false};
@@ -414,6 +414,13 @@ static bool probing()
 	return probe_depth != 0;
 }
 
+// Schema data placed in details["value"] (enum lists, const values, ...) is copied for each
+// error. Nothing reads details during a probe, so nothing is copied for one.
+static json keyword_value(const json &value)
+{
+	return probing() ? json() : value;
+}
+
 // Forwards errors with a message prefix. Used by the diagnostics phase of logical combinations.
 class prefixing_error_handler : public error_handler
 {
@@ -430,22 +437,27 @@ public:
 	}
 };
 
-class details_error_handler : public error_handler
+// Adds the property name to errors reported while validating that name against propertyNames.
+// The details carrying it are built only when an error is forwarded, and not during a probe.
+class property_name_error_handler : public error_handler
 {
-	error_handler &handler_;
-	json details_;
+	error_handler &next_;
+	const std::string &property_;
 
 public:
-	details_error_handler(error_handler &handler, json details)
-	    : handler_(handler), details_(std::move(details)) {}
+	property_name_error_handler(error_handler &next, const std::string &property)
+	    : next_(next), property_(property) {}
 
-	void error(const validation_error &source_error, const json &instance) override
+	void error(const validation_error &error, const json &instance) override
 	{
-		validation_error error = source_error;
-		for (const auto &detail : details_.items())
-			if (!error.details.contains(detail.key()))
-				error.details[detail.key()] = detail.value();
-		handler_.error(error, instance);
+		if (probing()) {
+			next_.error(error, instance);
+			return;
+		}
+		json details = error.details;
+		if (!details.contains("property"))
+			details["property"] = property_;
+		next_.error(validation_error{error.instance_location, error.message, error.keyword, std::move(details)}, instance);
 	}
 };
 
@@ -593,8 +605,7 @@ class type_schema : public schema
 		if (type)
 			type->validate(ptr, instance, patch, e);
 		else {
-			json details = {{"value", typeKeyword_}, {"actual_type", instance.type_name()}};
-			e.error(validation_error{ptr, "unexpected instance type", "type", details}, instance);
+			e.error(validation_error{ptr, "unexpected instance type", "type", {{"value", keyword_value(typeKeyword_)}, {"actual_type", instance.type_name()}}}, instance);
 		}
 
 		if (enum_.first) {
@@ -606,12 +617,12 @@ class type_schema : public schema
 				}
 
 			if (!seen_in_enum)
-				e.error(validation_error{ptr, "instance not found in required enum", "enum", {{"value", enum_.second}}}, instance);
+				e.error(validation_error{ptr, "instance not found in required enum", "enum", {{"value", keyword_value(enum_.second)}}}, instance);
 		}
 
 		if (const_.first &&
 		    const_.second != instance)
-			e.error(validation_error{ptr, "instance not const", "const", {{"value", const_.second}}}, instance);
+			e.error(validation_error{ptr, "instance not const", "const", {{"value", keyword_value(const_.second)}}}, instance);
 
 		for (auto l : logic_)
 			l->validate(ptr, instance, patch, e);
@@ -1080,7 +1091,7 @@ class required : public schema
 	{
 		for (auto &r : required_)
 			if (instance.find(r) == instance.end())
-				e.error(validation_error{ptr, "required property '" + r + "' not found in object as a dependency", "dependencies", {{"value", required_}, {"property", property_}, {"missing_property", r}}}, instance);
+				e.error(validation_error{ptr, "required property '" + r + "' not found in object as a dependency", "dependencies", {{"property", property_}, {"missing_property", r}}}, instance);
 	}
 
 public:
@@ -1116,12 +1127,12 @@ class object : public schema
 
 		for (auto &r : required_)
 			if (instance.find(r) == instance.end())
-				e.error(validation_error{ptr, "required property '" + r + "' not found in object", "required", {{"value", required_}, {"missing_property", r}}}, instance);
+				e.error(validation_error{ptr, "required property '" + r + "' not found in object", "required", {{"missing_property", r}}}, instance);
 
 		// for each property in instance
 		for (auto &p : instance.items()) {
 			if (propertyNames_) {
-				details_error_handler property_name_error(e, {{"property", p.key()}});
+				property_name_error_handler property_name_error(e, p.key());
 				propertyNames_->validate(ptr, p.key(), patch, property_name_error);
 			} else if (denyPropertyNames_) {
 				e.error(validation_error{ptr, "invalid property name '" + p.key() + "'", "propertyNames", {{"value", false}, {"property", p.key()}}}, p.key());
@@ -1289,7 +1300,7 @@ class array : public schema
 			for (auto it = instance.cbegin(); it != instance.cend(); ++it) {
 				auto v = std::find(it + 1, instance.end(), *it);
 				if (v != instance.end())
-					e.error(validation_error{ptr, "items have to be unique for this array", "uniqueItems", {{"value", true}, {"duplicate", *it}}}, instance);
+					e.error(validation_error{ptr, "items have to be unique for this array", "uniqueItems", {{"value", true}, {"duplicate", keyword_value(*it)}}}, instance);
 			}
 		}
 
