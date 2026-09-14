@@ -371,6 +371,65 @@ public:
 namespace
 {
 
+// Internal handlers. None of them retains an error past the callback: each either records a
+// flag or forwards immediately. This is what allows the instance to be passed by reference.
+
+// Speculative evaluation ("probing") asks a subschema only whether it validates: not/if/contains,
+// and the branches of allOf/anyOf/oneOf. While a probe is running nothing rendered for an error
+// can reach a user handler, so combinators skip their diagnostics phase. The probe state is a
+// thread-local depth so that it is seen through any forwarding handler in between and needs no
+// RTTI.
+class probe_error_handler : public error_handler
+{
+	bool failed_{false};
+
+public:
+	void error(const validation_error &) override { failed_ = true; }
+	operator bool() const { return failed_; }
+};
+
+thread_local unsigned probe_depth = 0;
+
+struct probe_scope {
+	probe_scope() { ++probe_depth; }
+	~probe_scope() { --probe_depth; }
+	probe_scope(const probe_scope &) = delete;
+	probe_scope &operator=(const probe_scope &) = delete;
+};
+
+// Every public validate() call is its own evaluation: a user's format or content checker may
+// run another validator while it is itself being invoked from inside a probe, and that inner
+// validation must report normally to its own handler.
+struct probe_context {
+	const unsigned saved_depth_;
+	probe_context()
+	    : saved_depth_(probe_depth) { probe_depth = 0; }
+	~probe_context() { probe_depth = saved_depth_; }
+	probe_context(const probe_context &) = delete;
+	probe_context &operator=(const probe_context &) = delete;
+};
+
+static bool probing()
+{
+	return probe_depth != 0;
+}
+
+// Forwards errors with a message prefix. Used by the diagnostics phase of logical combinations.
+class prefixing_error_handler : public error_handler
+{
+	error_handler &next_;
+	const std::string prefix_;
+
+public:
+	prefixing_error_handler(error_handler &next, std::string prefix)
+	    : next_(next), prefix_(std::move(prefix)) {}
+
+	void error(const validation_error &error) override
+	{
+		next_.error(validation_error{error.instance_location, error.instance, prefix_ + error.message, error.keyword, error.details});
+	}
+};
+
 class details_error_handler : public error_handler
 {
 	error_handler &handler_;
@@ -396,10 +455,13 @@ class logical_not : public schema
 
 	void validate(const json::json_pointer &ptr, const json &instance, json_patch &patch, error_handler &e) const final
 	{
-		basic_error_handler esub;
-		subschema_->validate(ptr, instance, patch, esub);
+		probe_error_handler probe;
+		{
+			probe_scope scope;
+			subschema_->validate(ptr, instance, patch, probe);
+		}
 
-		if (!esub)
+		if (!probe)
 			e.error(validation_error{ptr, instance, "the subschema has succeeded, but it is required to not validate", "not", json::object()});
 	}
 
@@ -424,63 +486,67 @@ enum logical_combination_types {
 	oneOf
 };
 
-class logical_combination_error_handler : public error_handler
-{
-public:
-	std::vector<validation_error> error_entry_list_;
-
-	void error(const validation_error &error) override
-	{
-		error_entry_list_.push_back(error);
-	}
-
-	void propagate(error_handler &handler, const std::string &prefix) const
-	{
-		for (const validation_error &error : error_entry_list_) {
-			validation_error prefixed_error = error;
-			prefixed_error.message = prefix + error.message;
-			handler.error(prefixed_error);
-		}
-	}
-
-	operator bool() const { return !error_entry_list_.empty(); }
-};
-
 template <enum logical_combination_types combine_logic>
 class logical_combination : public schema
 {
 	std::vector<std::shared_ptr<schema>> subschemata_;
 
+	// Speculative evaluation is done in two phases. The probe phase evaluates branches for
+	// validity only; defaults written by a failed branch are rolled back. Its verdict is
+	// authoritative: whenever the combination fails, the summary error is emitted from it, so a
+	// failure is reported even if a later re-evaluation were to behave differently. Only after
+	// that summary, and only when no enclosing probe is running, are the failed branches
+	// evaluated once more with a forwarding handler to deliver their individual errors straight
+	// to the consumer while the failing instance is alive.
 	void validate(const json::json_pointer &ptr, const json &instance, json_patch &patch, error_handler &e) const final
 	{
 		size_t count = 0;
-		logical_combination_error_handler error_summary;
 
 		for (std::size_t index = 0; index < subschemata_.size(); ++index) {
-			const std::shared_ptr<schema> &s = subschemata_[index];
-			logical_combination_error_handler esub;
+			probe_error_handler probe;
 			auto oldPatchSize = patch.get_json().size();
-			s->validate(ptr, instance, patch, esub);
-			if (!esub)
+			{
+				probe_scope scope;
+				subschemata_[index]->validate(ptr, instance, patch, probe);
+			}
+			if (!probe)
 				count++;
 			else {
 				patch.get_json().get_ref<nlohmann::json::array_t &>().resize(oldPatchSize);
-				esub.propagate(error_summary, "case#" + std::to_string(index) + "] ");
+				if (combine_logic == allOf) {
+					e.error(validation_error{ptr, instance, "at least one subschema has failed, but all of them are required to validate", "allOf", {{"failed_subschema", index}}});
+					if (!probing())
+						report_branch(ptr, instance, e, index);
+					return;
+				}
 			}
 
-			if (is_validate_complete(instance, ptr, e, esub, count, index))
+			if (combine_logic == anyOf && count == 1)
 				return;
+			if (combine_logic == oneOf && count > 1) {
+				e.error(validation_error{ptr, instance, "more than one subschema has succeeded, but exactly one of them is required to validate", "oneOf", {{"successful_subschemas", count}}});
+				return;
+			}
 		}
 
 		if (count == 0) {
 			e.error(validation_error{ptr, instance, "no subschema has succeeded, but one of them is required to validate. Type: " + key + ", number of failed subschemas: " + std::to_string(subschemata_.size()), key, {{"failed_subschemas", subschemata_.size()}}});
-			error_summary.propagate(e, "[combination: " + key + " / ");
+			if (!probing())
+				for (std::size_t index = 0; index < subschemata_.size(); ++index)
+					report_branch(ptr, instance, e, index);
 		}
 	}
 
-	// specialized for each of the logical_combination_types
+	// Diagnostics for one failed branch: re-evaluate it, forwarding each error with the case
+	// prefix. Defaults it writes are discarded with the scratch patch, one branch at a time.
+	void report_branch(const json::json_pointer &ptr, const json &instance, error_handler &e, size_t index) const
+	{
+		json_patch discarded_defaults;
+		prefixing_error_handler report(e, "[combination: " + key + " / case#" + std::to_string(index) + "] ");
+		subschemata_[index]->validate(ptr, instance, discarded_defaults, report);
+	}
+
 	static const std::string key;
-	static bool is_validate_complete(const json &, const json::json_pointer &, error_handler &, const logical_combination_error_handler &, size_t, size_t);
 
 public:
 	logical_combination(json &sch,
@@ -503,31 +569,6 @@ template <>
 const std::string logical_combination<anyOf>::key = "anyOf";
 template <>
 const std::string logical_combination<oneOf>::key = "oneOf";
-
-template <>
-bool logical_combination<allOf>::is_validate_complete(const json &, const json::json_pointer &, error_handler &e, const logical_combination_error_handler &esub, size_t, size_t current_schema_index)
-{
-	if (esub) {
-		const validation_error &first_error = esub.error_entry_list_.front();
-		e.error(validation_error{first_error.instance_location, first_error.instance, "at least one subschema has failed, but all of them are required to validate - " + first_error.message, "allOf", {{"failed_subschema", current_schema_index}}});
-		esub.propagate(e, "[combination: allOf / case#" + std::to_string(current_schema_index) + "] ");
-	}
-	return esub;
-}
-
-template <>
-bool logical_combination<anyOf>::is_validate_complete(const json &, const json::json_pointer &, error_handler &, const logical_combination_error_handler &, size_t count, size_t)
-{
-	return count == 1;
-}
-
-template <>
-bool logical_combination<oneOf>::is_validate_complete(const json &instance, const json::json_pointer &ptr, error_handler &e, const logical_combination_error_handler &, size_t count, size_t)
-{
-	if (count > 1)
-		e.error(validation_error{ptr, instance, "more than one subschema has succeeded, but exactly one of them is required to validate", "oneOf", {{"successful_subschemas", count}}});
-	return count > 1;
-}
 
 class type_schema : public schema
 {
@@ -576,10 +617,12 @@ class type_schema : public schema
 			l->validate(ptr, instance, patch, e);
 
 		if (if_) {
-			basic_error_handler err;
-
-			if_->validate(ptr, instance, patch, err);
-			if (!err) {
+			probe_error_handler probe;
+			{
+				probe_scope scope;
+				if_->validate(ptr, instance, patch, probe);
+			}
+			if (!probe) {
 				if (then_)
 					then_->validate(ptr, instance, patch, e);
 			} else {
@@ -1279,9 +1322,12 @@ class array : public schema
 		if (contains_) {
 			bool contained = false;
 			for (auto &item : instance) {
-				basic_error_handler local_e;
-				contains_->validate(ptr, item, patch, local_e);
-				if (!local_e) {
+				probe_error_handler probe;
+				{
+					probe_scope scope;
+					contains_->validate(ptr, item, patch, probe);
+				}
+				if (!probe) {
 					contained = true;
 					break;
 				}
@@ -1541,6 +1587,7 @@ json json_validator::validate(const json &instance) const
 
 json json_validator::validate(const json &instance, error_handler &err, const json_uri &initial_uri) const
 {
+	probe_context fresh_context;
 	json::json_pointer ptr;
 	json_patch patch;
 	root_->validate(ptr, instance, patch, err, initial_uri);

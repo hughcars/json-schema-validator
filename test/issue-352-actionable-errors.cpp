@@ -447,6 +447,234 @@ void test_nested_additional_property_context()
 	}
 }
 
+// propertyNames validates a json built from the property key, which is not part of the instance
+// document. Errors reaching the handler through a logical combination must still be delivered
+// with a live instance (regression: stack-use-after-return when errors were buffered).
+void test_property_names_inside_logical_combinations()
+{
+	const json instance = {{"toolong", 1}};
+
+	struct case_t {
+		json schema;
+		std::string keyword;
+		size_t expected_errors;
+	};
+	const std::vector<case_t> cases = {
+	    {{{"oneOf", {{{"type", "object"}, {"propertyNames", false}}, {{"type", "string"}}}}}, "propertyNames", 3},
+	    {{{"anyOf", {{{"type", "object"}, {"propertyNames", {{"maxLength", 2}}}}, {{"type", "string"}}}}}, "maxLength", 3},
+	    {{{"allOf", {{{"type", "object"}, {"propertyNames", {{"pattern", "^x"}}}}}}}, "pattern", 2},
+	};
+
+	for (const auto &c : cases) {
+		json_validator validator(c.schema);
+		collecting_error_handler errors;
+		validator.validate(instance, errors);
+		EXPECT_EQ(errors.errors.size(), c.expected_errors);
+		if (errors.errors.size() != c.expected_errors)
+			continue;
+		size_t found = 0;
+		for (const auto &propagated : errors.errors) {
+			if (propagated.keyword != c.keyword)
+				continue;
+			found++;
+			EXPECT_EQ(propagated.instance, json("toolong"));
+			EXPECT_EQ(propagated.details.at("property"), "toolong");
+		}
+		EXPECT_EQ(found, 1);
+		EXPECT_EQ(errors.errors.front().instance, instance); // the summary belongs to the combination
+	}
+
+	// the same through $ref and additionalProperties, two levels down
+	json_validator nested({
+	    {"definitions", {{"deny", false}}},
+	    {"allOf", {{{"additionalProperties", {{"propertyNames", {{"$ref", "#/definitions/deny"}}}}}}}},
+	});
+	collecting_error_handler errors;
+	nested.validate({{"outer", {{"bad", 0}}}}, errors);
+	EXPECT_EQ(errors.errors.size(), 2);
+	if (errors.errors.size() == 2) {
+		EXPECT_EQ(errors.errors[0].keyword, "allOf");
+		EXPECT_EQ(errors.errors[0].instance_location, json::json_pointer(""));
+		EXPECT_EQ(errors.errors[0].message, "at least one subschema has failed, but all of them are required to validate");
+		EXPECT_EQ(errors.errors[0].details, json({{"failed_subschema", 0}}));
+		EXPECT_EQ(errors.errors[1].instance_location, json::json_pointer("/outer"));
+		EXPECT_EQ(errors.errors[1].instance, json("bad"));
+		EXPECT_EQ(errors.errors[1].details, json({{"code", "false-schema"}, {"property", "bad"}}));
+	}
+}
+
+// The probe's verdict is authoritative. A checker whose outcome changes between the probe and
+// the diagnostics pass must not turn an established failure into silent success.
+void test_combination_failure_is_reported_even_if_reevaluation_passes()
+{
+	static int calls;
+	calls = 0;
+	auto flaky = [](const std::string &, const std::string &) {
+		if (calls++ == 0)
+			throw std::invalid_argument("rejected once");
+	};
+	const json schema = {{"allOf", {{{"format", "flaky"}}}}};
+
+	json_validator validator(schema, nullptr, flaky);
+	basic_error_handler failed;
+	validator.validate("value", failed);
+	EXPECT_EQ(static_cast<bool>(failed), true);
+
+	calls = 0;
+	json_validator throwing(schema, nullptr, flaky);
+	bool threw = false;
+	try {
+		throwing.validate("value");
+	} catch (const std::invalid_argument &) {
+		threw = true;
+	}
+	EXPECT_EQ(threw, true);
+}
+
+// Probing is visible through forwarding handlers (here propertyNames) and to the default
+// throwing handler, so a subschema is evaluated exactly once when no diagnostics are produced.
+void test_probe_evaluates_once()
+{
+	static int calls;
+	auto reject = [](const std::string &, const std::string &) {
+		calls++;
+		throw std::invalid_argument("rejected");
+	};
+
+	// failing branch behind propertyNames inside a successful anyOf: no diagnostics wanted
+	calls = 0;
+	json_validator any_of({{"anyOf", {{{"propertyNames", {{"allOf", {{{"format", "reject"}}}}}}}, json::object()}}}, nullptr, reject);
+	basic_error_handler failed;
+	any_of.validate({{"a", 0}}, failed);
+	EXPECT_EQ(static_cast<bool>(failed), false);
+	EXPECT_EQ(calls, 1);
+
+	// three nested allOf; the throwing handler stops at the outermost summary
+	calls = 0;
+	json_validator nested({{"allOf", {{{"allOf", {{{"allOf", {{{"format", "reject"}}}}}}}}}}}, nullptr, reject);
+	bool threw = false;
+	try {
+		nested.validate("value");
+	} catch (const std::invalid_argument &) {
+		threw = true;
+	}
+	EXPECT_EQ(threw, true);
+	EXPECT_EQ(calls, 1);
+}
+
+// A checker running inside a probe may validate with another validator; that validation is its
+// own evaluation and must deliver full diagnostics to its own handler, and the enclosing probe
+// must resume afterwards, also when the inner validation throws.
+void test_reentrant_validation_inside_probe()
+{
+	static std::vector<recorded_validation_error> inner_errors;
+	static int reject_calls;
+	inner_errors.clear();
+	reject_calls = 0;
+
+	auto checker = [](const std::string &format, const std::string &) {
+		if (format == "reject") {
+			reject_calls++;
+			throw std::invalid_argument("rejected");
+		}
+		json_validator inner({{"enum", {1, 2}}, {"anyOf", {{{"const", 1}}, {{"const", 2}}}}});
+		collecting_error_handler errors;
+		inner.validate(0, errors);
+		inner_errors = errors.errors;
+		try {
+			inner.validate(0); // throwing handler: unwinds through the inner validation
+		} catch (const std::invalid_argument &) {
+		}
+	};
+
+	// the checker runs while the outer anyOf probes its first branch; the inner allOf that
+	// follows must still see the probe (otherwise "reject" would be evaluated a second time)
+	json_validator outer({{"anyOf", {{{"allOf", {{{"type", "string"}, {"format", "nested"}}, {{"format", "reject"}}}}}, json::object()}}}, nullptr, checker);
+	basic_error_handler failed;
+	outer.validate("value", failed);
+	EXPECT_EQ(static_cast<bool>(failed), false);
+	EXPECT_EQ(reject_calls, 1);
+
+	EXPECT_EQ(inner_errors.size(), 4);
+	if (inner_errors.size() == 4) {
+		EXPECT_EQ(inner_errors[0].keyword, "enum");
+		EXPECT_EQ(inner_errors[0].details, json({{"value", json({1, 2})}}));
+		EXPECT_EQ(inner_errors[1].keyword, "anyOf");
+		EXPECT_EQ(inner_errors[2].keyword, "const");
+		EXPECT_EQ(inner_errors[2].details, json({{"value", 1}}));
+		EXPECT_EQ(inner_errors[3].message, "[combination: anyOf / case#1] instance not const");
+	}
+}
+
+// The probe state must survive a checker that throws something other than std::exception (which
+// string::validate does not catch) and a handler that runs another validator while errors are
+// being reported: both validations afterwards must deliver full diagnostics.
+void test_probe_state_after_unwinding_and_reentrant_handler()
+{
+	auto throw_int = [](const std::string &, const std::string &) { throw 42; };
+	json_validator unwound({{"allOf", {{{"format", "throw-int"}}}}}, nullptr, throw_int);
+	bool threw = false;
+	try {
+		unwound.validate("value");
+	} catch (int) {
+		threw = true;
+	}
+	EXPECT_EQ(threw, true);
+
+	static const json inner_schema = {{"anyOf", {{{"const", 2}}, {{"const", 3}}}}};
+	json_validator inner(inner_schema);
+	collecting_error_handler after_unwind;
+	inner.validate(1, after_unwind);
+	EXPECT_EQ(after_unwind.errors.size(), 3); // summary and both branches
+
+	// legacy-signature handler which validates something else from inside the callback
+	class reentrant_handler : public basic_error_handler
+	{
+		void error(const json::json_pointer &, const json &, const std::string &) override
+		{
+			json_validator inner(inner_schema);
+			collecting_error_handler errors;
+			inner.validate(1, errors);
+			inner_error_counts.push_back(errors.errors.size());
+		}
+
+	public:
+		std::vector<size_t> inner_error_counts;
+	};
+
+	const json outer_schema = {{"allOf", {{{"const", 1}}}}};
+	json_validator outer(outer_schema);
+	reentrant_handler handler;
+	outer.validate(0, handler);
+	EXPECT_EQ(handler.inner_error_counts.size(), 2); // allOf summary, then the const error
+	for (size_t count : handler.inner_error_counts)
+		EXPECT_EQ(count, 3);
+}
+
+// Failed branches inside a combination that ultimately succeeds must not leak defaults, and
+// the diagnostics pass for a failed combination must not add defaults a second time.
+void test_combination_default_values()
+{
+	const json schema = {
+	    {"anyOf",
+	     {
+	         {{"type", "object"}, {"required", {"a"}}, {"properties", {{"x", {{"default", 1}}}}}},
+	         {{"type", "object"}, {"required", {"b"}}, {"properties", {{"y", {{"default", 2}}}}}},
+	     }},
+	};
+	json_validator validator(schema);
+	collecting_error_handler errors;
+
+	json patch = validator.validate({{"b", 0}}, errors);
+	EXPECT_EQ(errors.errors.size(), 0);
+	EXPECT_EQ(patch, json::parse(R"([{"op":"add","path":"/y","value":2}])"));
+
+	errors.errors.clear();
+	patch = validator.validate(json::object(), errors);
+	EXPECT_EQ(errors.errors.size(), 3);
+	EXPECT_EQ(patch, json::array());
+}
+
 void test_non_keyword_error_details()
 {
 	collecting_error_handler errors;
@@ -538,6 +766,12 @@ int main()
 	test_details_survive_additional_properties();
 	test_all_additional_property_errors();
 	test_nested_additional_property_context();
+	test_property_names_inside_logical_combinations();
+	test_combination_failure_is_reported_even_if_reevaluation_passes();
+	test_probe_evaluates_once();
+	test_reentrant_validation_inside_probe();
+	test_probe_state_after_unwinding_and_reentrant_handler();
+	test_combination_default_values();
 	test_non_keyword_error_details();
 	test_basic_error_handler();
 	test_incomplete_error_handler();
