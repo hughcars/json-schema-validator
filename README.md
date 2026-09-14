@@ -314,8 +314,15 @@ public:
 ```
 
 Keyword details are preserved when errors are propagated through `allOf`, `anyOf`, and
-`oneOf`. Applications which only need to know whether validation failed can use
-`basic_error_handler`, which provides boolean state and `reset()`.
+`oneOf`. Branches of these combinations are first evaluated for validity only, and the
+combination's summary error is reported from that result at the combination's own location;
+the failing branches' errors follow it with a `[combination: <keyword> / case#<index>]` prefix.
+When the combination fails and the
+handler does not throw, the failed branches are then evaluated again to deliver their individual
+errors, so custom `format` or content checkers may be invoked more than once for the same value
+in that case; a failure nested inside several combinations is re-evaluated once per level.
+Applications which only need to know whether validation failed can use `basic_error_handler`,
+which provides boolean state and `reset()`.
 
 # Compliance
 
