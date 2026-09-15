@@ -227,6 +227,10 @@ public:
 
 	// validate a json-document based on the root-schema with a custom error-handler
 	json validate(const json &, error_handler &, const json_uri &initial_uri = json_uri("#")) const;
+
+	// answer only whether a json-document is valid: no diagnostics are produced and no default
+	// values are collected, so failed subschemas are never evaluated a second time
+	bool is_valid(const json &, const json_uri &initial_uri = json_uri("#")) const;
 };
 
 } // namespace json_schema

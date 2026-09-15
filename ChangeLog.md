@@ -6,6 +6,8 @@
   source-compatible and is called by default. `required` and array-valued `dependencies`
   errors identify the missing property without repeating the complete keyword array in every
   error. Fixes #352, related to #321 and #322.
+- Added `json_validator::is_valid()` for validity-only checks: one evaluation, no diagnostics,
+  no default values.
 - ABI change: `error_handler` gains a virtual function. Binaries linked against 2.4.x must be
   rebuilt; the library `SOVERSION` is unchanged.
 - Logical combinations (`allOf`, `anyOf`, `oneOf`) evaluate their branches for validity first

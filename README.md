@@ -321,8 +321,10 @@ When the combination fails and the
 handler does not throw, the failed branches are then evaluated again to deliver their individual
 errors, so custom `format` or content checkers may be invoked more than once for the same value
 in that case; a failure nested inside several combinations is re-evaluated once per level.
-Applications which only need to know whether validation failed can use `basic_error_handler`,
-which provides boolean state and `reset()`.
+Applications which only need to know whether a document is valid should call
+`json_validator::is_valid()`: it evaluates the document once, renders no diagnostics and collects
+no default values. `basic_error_handler` remains available for handlers which only need boolean
+state and `reset()`.
 
 # Compliance
 

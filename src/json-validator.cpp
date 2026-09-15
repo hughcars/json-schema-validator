@@ -1605,5 +1605,16 @@ json json_validator::validate(const json &instance, error_handler &err, const js
 	return patch;
 }
 
+bool json_validator::is_valid(const json &instance, const json_uri &initial_uri) const
+{
+	probe_context fresh_context;
+	probe_scope whole_document_is_a_probe;
+	probe_error_handler probe;
+	json::json_pointer ptr;
+	json_patch discarded_defaults;
+	root_->validate(ptr, instance, discarded_defaults, probe, initial_uri);
+	return !probe;
+}
+
 } // namespace json_schema
 } // namespace nlohmann

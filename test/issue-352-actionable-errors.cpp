@@ -685,6 +685,30 @@ void test_validation_error_is_a_value_type()
 	EXPECT_EQ(errors.size(), 1);
 }
 
+// is_valid() answers with the probe alone: same verdict as a handler, nothing evaluated twice.
+void test_is_valid()
+{
+	static int calls;
+	auto reject = [](const std::string &, const std::string &) {
+		calls++;
+		throw std::invalid_argument("rejected");
+	};
+	const json nested_schema = {{"allOf", {{{"allOf", {{{"allOf", {{{"format", "reject"}}}}}}}}}}};
+	json_validator nested(nested_schema, nullptr, reject);
+	calls = 0;
+	EXPECT_EQ(nested.is_valid("value"), false);
+	EXPECT_EQ(calls, 1);
+
+	const json schema = {{"anyOf", {{{"type", "object"}, {"propertyNames", {{"maxLength", 2}}}}, {{"type", "string"}}}}};
+	json_validator validator(schema);
+	EXPECT_EQ(validator.is_valid({{"ok", 1}}), true);
+	EXPECT_EQ(validator.is_valid({{"toolong", 1}}), false);
+	EXPECT_EQ(validator.is_valid("text"), true);
+
+	json_validator empty;
+	EXPECT_EQ(empty.is_valid(nullptr), false);
+}
+
 void test_non_keyword_error_details()
 {
 	collecting_error_handler errors;
@@ -783,6 +807,7 @@ int main()
 	test_probe_state_after_unwinding_and_reentrant_handler();
 	test_combination_default_values();
 	test_validation_error_is_a_value_type();
+	test_is_valid();
 	test_non_keyword_error_details();
 	test_basic_error_handler();
 	test_incomplete_error_handler();
